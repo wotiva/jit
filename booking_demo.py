@@ -3,14 +3,12 @@ import pandas as pd
 import math
 
 st.set_page_config(page_title="1Mphamvu — Swap Booking", layout="wide")
-
-# Brand header
 st.markdown("### 1Mphamvu")
 st.title("Swap Booking — Mvera → Salima")
-st.caption("JIT booking with inbound arrivals, flips, and estimated rest")
+st.caption("Inventory-minimising battery booking: lowest sufficient charge, ready before departure")
 
 SPEED = 60.0
-NEXT_LEG_KM = 85.0
+LEG_KM = 40.0
 FULL_CHARGE_MIN = 95.0
 SWAP_MIN = 5.0
 
@@ -47,12 +45,12 @@ straight_km = haversine_km(ORIGIN[0], ORIGIN[1], DEST[0], DEST[1])
 
 def init_state():
     if "batteries" not in st.session_state:
-        # 4 batteries, varied; middle (3rd) wins on JIT at 85 km leg
+        # 4 batteries, varied; middle (3rd) wins as lowest sufficient
         st.session_state.batteries = pd.DataFrame([
             {"id": "BT74 010175", "charge": 95},
-            {"id": "BT74 010176", "charge": 87},
-            {"id": "BT74 010177", "charge": 85},
-            {"id": "BT74 010178", "charge": 99},
+            {"id": "BT74 010176", "charge": 55},
+            {"id": "BT74 010177", "charge": 42},
+            {"id": "BT74 010178", "charge": 70},
         ])
     if "booking" not in st.session_state:
         st.session_state.booking = None
@@ -71,14 +69,16 @@ def log(kind, msg):
 # ---------- sidebar ----------
 st.sidebar.header("Trip")
 speed = st.sidebar.slider("Average speed (km/h)", 30, 120, int(SPEED))
-winding = st.sidebar.slider("Road winding factor (× straight line)", 1.0, 3.0, 1.33, 0.05)
-leg_km = st.sidebar.slider("Next leg distance (km)", 20, 150, int(NEXT_LEG_KM))
+leg_km = st.sidebar.slider("Next leg distance (km)", 20, 120, int(LEG_KM))
 rest_min = st.sidebar.slider("Estimated rest at station (min)", 0, 60, 15)
 swap_min = st.sidebar.slider("Swap time (min)", 0, 15, int(SWAP_MIN))
+rider_charge = st.sidebar.slider("Rider battery at start (%)", 20, 100, 60)
 
-road_km = straight_km * winding
+winding = st.sidebar.slider("Road winding factor (× straight line)", 1.0, 3.0, 1.33, 0.05)
+
 arrive_min = leg_km / speed * 60.0
 depart_min = arrive_min + swap_min + rest_min
+road_km = straight_km * winding
 
 with st.sidebar.expander("Edit battery states"):
     for i in st.session_state.batteries.index:
@@ -92,14 +92,16 @@ def scored():
     df = st.session_state.batteries.copy()
     df["ready"] = df["charge"].apply(lambda c: ready_min(c, target=leg_km))
     df["feasible"] = df["charge"] >= leg_km
-    df["gap"] = (df["ready"] - arrive_min).abs()
+    df["ready_by_depart"] = df["ready"] <= depart_min
     return df
 
-def best(df):
-    f = df[df["feasible"]]
+def pick_lowest_sufficient(df):
+    f = df[df["feasible"] & df["ready_by_depart"]]
     if f.empty:
         return None
-    return f.sort_values("gap").iloc[0]["id"]
+    # lowest charge first; tie-break: earliest ready
+    f = f.sort_values(["charge", "ready"], ascending=[True, True])
+    return f.iloc[0]["id"]
 
 def wait_eta(df):
     d = df.copy()
@@ -117,6 +119,12 @@ st.write(
     f"= road **{road_km:.1f} km** · at {speed} km/h → arrive **T+{arrive_min:.0f}** · "
     f"swap {swap_min} · rest {rest_min} → depart **T+{depart_min:.0f}**"
 )
+margin = rider_charge - leg_km
+if margin >= 0:
+    st.info(f"Rider battery: **{rider_charge}%** → range {rider_charge:.0f} km · "
+            f"leg {leg_km:.0f} km → arrival margin **{margin:.0f} km** ✅")
+else:
+    st.error(f"Rider battery: **{rider_charge}%** · short by **{-margin:.0f} km** ❌ cannot reach station")
 
 # ---------- booking ----------
 st.subheader("Current booking")
@@ -124,54 +132,64 @@ if booking:
     row = df[df["id"] == booking].iloc[0]
     st.success(
         f"**{row['id']}** — {row['charge']}% · ready in {row['ready']:.0f} min · "
-        f"you arrive T+{arrive_min:.0f} · gap {row['gap']:.0f} min"
+        f"you arrive T+{arrive_min:.0f} · departs T+{depart_min:.0f} "
+        f"(ready by departure: {'yes' if row['ready_by_depart'] else 'no'})"
     )
 else:
     w = wait_eta(df)
     st.warning(
-        f"No feasible battery yet. Earliest: **{w['id']}** reaches "
-        f"{leg_km:.0f}% in ~{w['wait']:.0f} min."
+        f"No battery is both feasible (≥{leg_km:.0f}%) and ready by departure. "
+        f"Earliest feasible: **{w['id']}** reaches {leg_km:.0f}% in ~{w['wait']:.0f} min."
     )
 
 # ---------- comparison ----------
-st.subheader("Highest-charge rule vs JIT rule")
-feasible_df = df[df["feasible"]]
+st.subheader("Highest charge vs lowest sufficient (inventory-minimising)")
+feasible_df = df[df["feasible"] & df["ready_by_depart"]]
 if feasible_df.empty:
-    st.caption("No feasible battery to compare.")
+    st.caption("No feasible battery ready by departure to compare.")
 else:
     highest = feasible_df.sort_values("charge", ascending=False).iloc[0]
-    jit = feasible_df.sort_values("gap").iloc[0]
+    lowest = feasible_df.sort_values(["charge", "ready"]).iloc[0]
     comp = pd.DataFrame([
-        {"Rule": "Highest charge", "Battery": highest["id"], "Charge %": highest["charge"],
-         "Ready (min)": round(highest["ready"], 1), "Gap (min)": round(highest["gap"], 1),
-         "Outcome": "Ready too early — wasted readiness"},
-        {"Rule": "JIT (ours)", "Battery": jit["id"], "Charge %": jit["charge"],
-         "Ready (min)": round(jit["ready"], 1), "Gap (min)": round(jit["gap"], 1),
-         "Outcome": "Ready just as you arrive — least waste"},
+        {
+            "Rule": "Highest charge (wasteful)",
+            "Battery": highest["id"],
+            "Charge %": highest["charge"],
+            "Ready (min)": round(highest["ready"], 1),
+            "Effect": "Uses a high-charge battery this rider doesn't need",
+        },
+        {
+            "Rule": "Lowest sufficient (ours)",
+            "Battery": lowest["id"],
+            "Charge %": lowest["charge"],
+            "Ready (min)": round(lowest["ready"], 1),
+            "Effect": "Leaves fuller batteries free for other riders",
+        },
     ])
     st.dataframe(comp, use_container_width=True, hide_index=True)
-    if highest["id"] != jit["id"]:
+
+    fuller_freed = len(feasible_df[feasible_df["charge"] > lowest["charge"]])
+    if highest["id"] != lowest["id"]:
         st.caption(
-            f"JIT picks **{jit['id']}** (gap {jit['gap']:.0f}) instead of "
-            f"**{highest['id']}** (gap {highest['gap']:.0f})."
+            f"Choosing **{lowest['id']}** ({lowest['charge']}%) instead of "
+            f"**{highest['id']}** ({highest['charge']}%) leaves "
+            f"**{fuller_freed} fuller battery(ies)** available for other riders — "
+            f"fewer batteries needed in the network."
         )
 
-# ---------- batteries (highlighted) ----------
+# ---------- batteries ----------
 st.subheader("Batteries at station")
 b = df.copy()
 b["feasible"] = b["feasible"].map({True: "yes", False: "no"})
-b = b[["id", "charge", "ready", "gap", "feasible"]].round(1)
+b["ready by depart"] = b["ready_by_depart"].map({True: "yes", False: "no"})
+b = b[["id", "charge", "ready", "feasible", "ready by depart"]].round(1)
 
 def highlight_booked(row):
     if row["id"] == booking:
         return ["background-color: #d4edda; color: #155724; font-weight: bold"] * len(row)
     return [""] * len(row)
 
-st.dataframe(
-    b.style.apply(highlight_booked, axis=1),
-    use_container_width=True,
-    hide_index=True,
-)
+st.dataframe(b.style.apply(highlight_booked, axis=1), use_container_width=True, hide_index=True)
 
 # ---------- map ----------
 st.subheader("Route")
@@ -186,10 +204,7 @@ try:
     folium.PolyLine([ORIGIN, DEST], color="gray", weight=2, dash_array="6").add_to(m)
     folium.PolyLine(curve_pts, color="red", weight=4).add_to(m)
     st_folium(m, width=900, height=420)
-    st.caption(
-        f"Straight {straight_km:.1f} km · winding ×{winding:.2f} → "
-        f"estimated road {road_km:.1f} km."
-    )
+    st.caption(f"Straight {straight_km:.1f} km · winding ×{winding:.2f} → road {road_km:.1f} km.")
 except Exception as e:
     st.info(f"Map not shown: {e}")
 
@@ -197,21 +212,21 @@ except Exception as e:
 st.divider()
 a1, a2 = st.columns(2)
 with a1:
-    if st.button("Book best battery", use_container_width=True):
+    if st.button("Book lowest sufficient battery", use_container_width=True):
         st.session_state.clock = 0
         st.session_state.log = []
-        pick = best(scored())
+        pick = pick_lowest_sufficient(scored())
         st.session_state.booking = pick
         if pick:
-            log("book", f"Booked {pick}")
+            log("book", f"Booked {pick} (lowest sufficient)")
         else:
             w = wait_eta(scored())
-            log("wait", f"No feasible battery — wait ~{w['wait']:.0f} min for {w['id']}")
+            log("wait", f"No feasible+ready battery — wait ~{w['wait']:.0f} min for {w['id']}")
         st.rerun()
 
 with a2:
     with st.popover("Simulate battery arrival"):
-        new_charge = st.slider("New battery charge (%)", 50, 100, 92)
+        new_charge = st.slider("New battery charge (%)", 20, 100, 45)
         if st.button("Arrive"):
             st.session_state.clock += 10
             new_id = f"BT74 01{st.session_state.counter:04d}"
@@ -223,7 +238,7 @@ with a2:
             )
             log("arrive", f"{new_id} arrived at {new_charge}%")
             old = st.session_state.booking
-            new_pick = best(scored())
+            new_pick = pick_lowest_sufficient(scored())
             if new_pick != old:
                 if old:
                     log("flip", f"FLIP → released {old}, now holding {new_pick}")
@@ -244,6 +259,6 @@ else:
     st.caption("Book a battery, then simulate an arrival to see flips.")
 
 st.caption(
-    f"Leg {leg_km:.0f} km · target {leg_km:.0f}% · full charge {FULL_CHARGE_MIN:.0f} min · "
-    f"feasible if charge ≥ {leg_km:.0f}%"
+    f"Leg {leg_km:.0f} km · feasibility ≥{leg_km:.0f}% · full charge {FULL_CHARGE_MIN:.0f} min · "
+    f"rule: lowest charge that is feasible and ready by departure"
 )
